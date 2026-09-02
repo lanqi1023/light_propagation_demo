@@ -1,48 +1,43 @@
-# CLAUDE.md
+# Repository guidance
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This repository contains one active project: a differentiable model of incoherent MicroLED illumination propagating through cascaded metasurfaces.
 
-## Overview
+## Project layout
 
-An interactive web demo of the **Angular Spectrum Method (ASM)** for optical wave propagation. The computation core is a pure Python package (`lightprop/`) served via FastAPI; the frontend is a minimal HTML/JS shell that calls `/api/compute`.
+- `incoherent_metasurface_modes/`: source code, tests, examples, mathematical model, and generated figures.
+- `docs/research/`: the complete discussion record, concise design conclusions, and the earlier modeling answer.
+- `README.md`: repository entry point.
 
-## Commands
+The former HTML/FastAPI angular-spectrum demo was intentionally removed. Do not restore or depend on `lightprop/`, `server.py`, `templates/`, `static/`, or the former root-level `tests/`.
+
+## Environment and commands
+
+Use the environment inside the active project when it exists:
 
 ```bash
-python server.py            # serve on http://localhost:8080
-pytest tests/               # run unit tests
+cd incoherent_metasurface_modes
+.venv/bin/python -m pytest -q
+PYTHONPATH=src .venv/bin/python examples/simple_demo.py
+PYTHONPATH=src .venv/bin/python examples/visualize_demo.py
+PYTHONPATH=src .venv/bin/python examples/train_demo.py
 ```
 
-No build step; Python-only backend.
+To create a new environment:
 
-## Architecture
+```bash
+cd incoherent_metasurface_modes
+python3 -m venv .venv
+.venv/bin/python -m pip install -e '.[torch,test,viz]'
+```
 
-### Two-layer split
+## Modeling conventions
 
-- **Python backend** ([lightprop/](lightprop/)): physics computation, pure CPU with numpy/scipy.
-  - `types.py`: `Params` / `Result` dataclasses.
-  - `aperture.py`: slit, double-slit, circle, rectangle, free, upload.
-  - `angspec.py`: band-limited ASM + zero-padding.
-  - `optics.py`: tilt, temporal/spatial coherence.
-  - `fft.py`: 2D FFT via `scipy.fft`.
-  - `pipeline.py`: orchestrator `compute(params) -> Result`.
-- **FastAPI server** ([server.py](server.py)): serves static files and exposes `POST /api/compute`.
-- **Frontend shell** ([templates/index.html](templates/index.html), [static/app_shell.js](static/app_shell.js), [static/colormap.js](static/colormap.js), [static/style.css](static/style.css)): UI bindings, canvas rendering, fetch to `/api/compute`.
+- PyTorch complex tensors represent coherent fields for one source mode at a time.
+- Mutually incoherent LED/sub-emitter modes are combined by summing detector intensities, never field amplitudes.
+- The first surface is a rectangular-aperture collimating metalens with an optional trainable phase residual.
+- Later surfaces are trainable phase-only masks separated by angular-spectrum propagation.
+- Detector outputs are power integrals over non-overlapping regions.
+- Preserve differentiability with respect to all trainable phase parameters.
+- Keep exact incoherent mode summation as the reference model; stochastic random-phase estimation is an optional approximation.
 
-## Physics pipeline
-
-1. `Aperture.generate(...)` builds input field `U0` (shape `(Nx, Ny)` complex128).
-2. `Optics.applyTilt(...)` optionally applies a plane-wave tilt.
-3. `AngSpec.propagate(...)` propagates to distance `dz` via ASM with optional 2x zero-padding and Matsushima 2009 band-limiting.
-4. Result post-processing computes intensity, phase, and center cross-sections.
-
-## Critical conventions
-
-- **Array layout**: numpy `(Nx, Ny)` complex128, row-major `(row=y, col=x)`.
-- **Grid axes**: `Nx` = rows = y-dimension, `Ny` = cols = x-dimension.
-- **Units**: `dx, dy` in μm; `lambda_nm` in nm; `dz` in mm; `Lx = Nx * dx` in μm.
-- **Auto grid upgrade**: if band-limiting produces a degenerate result with <=4 unique intensity values, `pipeline.py` will automatically upgrade to a larger grid to preserve physical accuracy.
-
-## Testing
-
-pytest tests live in [tests/](tests/): `test_fft.py`, `test_aperture.py`, `test_angspec.py`.
+See `incoherent_metasurface_modes/MATHEMATICAL_MODEL.md` before changing normalization, propagation, source sampling, or detector integration.
