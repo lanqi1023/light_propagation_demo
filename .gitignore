@@ -1,8 +1,19 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+nohup.out
 
-# Playwright
-node_modules/
-/test-results/
-/playwright-report/
-/blob-report/
-/playwright/.cache/
-/playwright/.auth/
+# Local safety archives are deliberately kept out of Git remotes.
+.backups/
+archives/
+*.tar.gz
+*.tar.xz
+*.zip
+
+# Editor
+.idea/
+.vscode/
+*.swp

@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>角谱法传播演示</title>
-<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
 
@@ -13,8 +13,8 @@
     <h1>角谱法传播演示</h1>
     <div class="header-controls">
       <span class="mode-label">模式:</span>
-      <button id="modeToggle" class="mode-btn active">实时 256×256</button>
-      <span class="mode-hint">高质量 512×512</span>
+      <span id="modeReal" class="mode-option active">实时 256×256</span>
+      <span id="modeHQ" class="mode-option">高质量 512×512</span>
     </div>
   </header>
 
@@ -125,8 +125,8 @@
         <div id="propParams" class="group-body">
           <div class="field">
             <label>dz (mm)</label>
-            <input type="range" id="dzRange" min="0.001" max="1000" value="100" step="0.001">
-            <input type="number" id="dzNum" value="100" min="0.001" max="1000" step="1">
+            <input type="range" id="dzRange" min="1" max="1000" value="100" step="1">
+            <input type="number" id="dzNum" value="100" min="1" max="1000" step="1">
           </div>
         </div>
       </section>
@@ -252,7 +252,7 @@
   </footer>
 </div>
 
-<script src="js/colormap.js"></script>
-<script src="js/app.js"></script>
+<script src="/static/colormap.js"></script>
+<script src="/static/app_shell.js"></script>
 </body>
 </html>

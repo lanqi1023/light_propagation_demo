@@ -1,10 +1,13 @@
-// ─── Main Thread ───
+// ─── Main Thread Shell (physics logic moved to Python backend) ───
+// Version: python-backend-only
 (function() {
   'use strict';
 
-  // ─── DOM refs ───
   const $ = id => document.getElementById(id);
   const $$ = sel => document.querySelectorAll(sel);
+
+  function safeParseInt(v, fallback) { const n = parseInt(v); return isNaN(n) ? fallback : n; }
+  function safeParseFloat(v, fallback) { const n = parseFloat(v); return isNaN(n) ? fallback : n; }
 
   // Canvas + context
   const inputCanvas   = $('inputCanvas');
@@ -23,7 +26,6 @@
   const ctxCurrent   = currentCanvas.getContext('2d');
   const ctxDiff      = diffCanvas.getContext('2d');
 
-  // RGBA pixel buffers for Canvas rendering
   const CANVAS_SIZE = 256;
   let rgbaIntensity = new Uint8ClampedArray(CANVAS_SIZE * CANVAS_SIZE * 4);
   let rgbaPhase     = new Uint8ClampedArray(CANVAS_SIZE * CANVAS_SIZE * 4);
@@ -31,93 +33,74 @@
   let imageDataPhase     = new ImageData(rgbaPhase, CANVAS_SIZE, CANVAS_SIZE);
 
   // ─── State ───
-  let requestId = 0;
-  let worker = null;
   let debounceTimer = null;
   let isComputing = false;
+  let pendingRecompute = false;
   let isHighQuality = false;
-  let lastResult = null; // cached for screenshot + comparison
-  let uploadedPixels = null; // uploaded image data (Float64Array, amplitude only)
+  let lastResult = null;
+  let uploadedPixels = null;
 
-  // ─── Worker init ───
-  function initWorker() {
-    worker = new Worker('js/worker.js');
-
-    worker.onmessage = function(e) {
-      const msg = e.data;
-      switch (msg.type) {
-        case 'pong':
-          setStatus('Worker 通信正常');
-          break;
-        case 'fftSelfTest':
-          console.log('[FFT]', msg.msg);
-          if (!msg.passed) setStatus('FFT 自测失败: ' + msg.msg);
-          break;
-        case 'result':
-          handleResult(msg);
-          break;
-        case 'error':
-          console.error('[Worker]', msg.message);
-          setStatus('错误: ' + msg.message);
-          break;
-      }
-    };
-
-    worker.onerror = function(err) {
-      console.error('Worker error:', err);
-      setStatus('Worker 错误');
-    };
-
-    // Send ping to verify communication
-    worker.postMessage({ type: 'ping' });
+  // ─── Decode base64 from Python backend ───
+  function decodeBase64(base64) {
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+    return bytes;
   }
 
   // ─── Handle computation result ───
   function handleResult(msg) {
-    if (msg.id !== requestId) return; // stale response
+    if (pendingRecompute) {
+      pendingRecompute = false;
+      requestCompute();
+      return;
+    }
     isComputing = false;
     lastResult = msg;
 
-    const nx = msg.info.nx || CANVAS_SIZE;
-    const ny = msg.info.ny || CANVAS_SIZE;
+    const Nx = msg.info.nx || CANVAS_SIZE;  // rows
+    const Ny = msg.info.ny || CANVAS_SIZE;  // cols
+    const nPixels = Nx * Ny;
 
-    // Resize canvases to match result dimensions
-    [intensityCanvas, phaseCanvas, inputCanvas].forEach(c => {
-      if (c.width !== nx || c.height !== ny) { c.width = nx; c.height = ny; }
+    // Decode base64 payloads
+    const intensity = decodeBase64(msg.intensity);
+    const phase = decodeBase64(msg.phase);
+    const crossX = new Float64Array(msg.cross_x);
+    const crossY = new Float64Array(msg.cross_y);
+
+    // Resize result canvases: width=cols=x, height=rows=y
+    [intensityCanvas, phaseCanvas].forEach(c => {
+      if (c.width !== Ny || c.height !== Nx) { c.width = Ny; c.height = Nx; }
     });
 
     // Re-allocate pixel buffers if size changed
-    const nPixels = nx * ny;
-    if (!imageDataIntensity || imageDataIntensity.width !== nx || imageDataIntensity.height !== ny) {
+    if (!imageDataIntensity || imageDataIntensity.width !== Ny || imageDataIntensity.height !== Nx) {
       rgbaIntensity = new Uint8ClampedArray(nPixels * 4);
       rgbaPhase     = new Uint8ClampedArray(nPixels * 4);
-      imageDataIntensity = new ImageData(rgbaIntensity, nx, ny);
-      imageDataPhase     = new ImageData(rgbaPhase, nx, ny);
+      imageDataIntensity = new ImageData(rgbaIntensity, Ny, Nx);
+      imageDataPhase     = new ImageData(rgbaPhase, Ny, Nx);
     }
 
     // Render intensity
-    applyIntensityLut(msg.intensity, rgbaIntensity);
+    applyIntensityLut(intensity, rgbaIntensity);
     ctxIntensity.putImageData(imageDataIntensity, 0, 0);
 
     // Render phase (with alpha mask)
-    applyPhaseLut(msg.phase, msg.intensity, rgbaPhase, 5);
+    applyPhaseLut(phase, intensity, rgbaPhase, 5);
     ctxPhase.putImageData(imageDataPhase, 0, 0);
 
     // Render cross-section
-    drawCrossSection(msg.crossX, msg.crossY, msg.info);
+    drawCrossSection(crossX, crossY, msg.info);
 
     // Update dashboard
     updateDashboard(msg.info);
 
-    // Update comparison if visible
-    if (isComparisonVisible()) {
-      // Will be implemented in M10
-    }
-
     setStatus('✓ 完成 (' + msg.info.computationTime + 'ms)');
   }
 
-  // ─── Draw cross-section ───
+  // ─── Draw cross-section (unchanged from original) ───
   function drawCrossSection(crossX, crossY, info) {
     const w = crossCanvas.width;
     const h = crossCanvas.height;
@@ -127,18 +110,14 @@
     const plotH = h - pad.top - pad.bottom;
 
     ctx.clearRect(0, 0, w, h);
-
-    // Background
     ctx.fillStyle = '#0d1117';
     ctx.fillRect(0, 0, w, h);
 
-    // Find max for normalization
     let maxVal = 0;
     for (let k = 0; k < crossX.length; k++) if (crossX[k] > maxVal) maxVal = crossX[k];
     for (let k = 0; k < crossY.length; k++) if (crossY[k] > maxVal) maxVal = crossY[k];
     if (maxVal === 0) maxVal = 1;
 
-    // Helper: data → pixel coords
     function toPixelX(val, min, max) {
       return pad.left + (val - min) / (max - min) * plotW;
     }
@@ -146,11 +125,10 @@
       return pad.top + plotH - (val / maxVal) * plotH;
     }
 
-    // Determine physical bounds for X section (horizontal axis = row index → physical coords)
     const Lx = info.Lx || 1;
     const Ly = info.Ly || 1;
 
-    // Draw X-section (crossX: variation along columns, i.e., x-direction)
+    // crossX (from Python): varies along x-direction → use Lx
     ctx.strokeStyle = '#58a6ff';
     ctx.lineWidth = 1.5;
     ctx.beginPath();
@@ -163,7 +141,7 @@
     }
     ctx.stroke();
 
-    // Draw Y-section (crossY: variation along rows, i.e., y-direction)
+    // crossY (from Python): varies along y-direction → use Ly
     ctx.strokeStyle = '#f0883e';
     ctx.beginPath();
     const nx = crossY.length;
@@ -203,7 +181,6 @@
       const py = pad.top + plotH - (k / yTicks) * plotH;
       ctx.fillText(val.toFixed(1), pad.left - 4, py);
     }
-    // Axis title
     ctx.textAlign = 'center';
     ctx.textBaseline = 'top';
     ctx.fillStyle = '#484f58';
@@ -231,13 +208,13 @@
     ctx.fillText('Y 截面', pad.left + plotW - 104, pad.top + 12);
   }
 
-  // ─── Update dashboard ───
+  // ─── Update dashboard (unchanged) ───
   function updateDashboard(info) {
     $('fresnelDisplay').textContent = info.fresnelNum ? info.fresnelNum.toFixed(2) : '—';
     $('dashLx').textContent = info.Lx ? info.Lx.toFixed(3) + ' mm' : '—';
     $('dashLy').textContent = info.Ly ? info.Ly.toFixed(3) + ' mm' : '—';
     $('timeDisplay').textContent = info.computationTime ? info.computationTime + ' ms' : '—';
-    $('dashN').textContent = (info.nx || '?') + '×' + (info.ny || '?');
+    $('dashN').textContent = (info.ny || '?') + '×' + (info.nx || '?');
 
     const statusEl = $('samplingStatus');
     if (info.samplingOk) {
@@ -249,7 +226,7 @@
     }
   }
 
-  // ─── Gather all params from UI ───
+  // ─── Gather all params from UI (unchanged) ───
   function gatherParams() {
     const apertureType = document.querySelector('input[name="aperture"]:checked').value;
     const params = {};
@@ -269,22 +246,23 @@
         params.width = parseFloat($('rectWidthNum').value);
         params.height = parseFloat($('rectHeightNum').value);
         break;
+      case 'upload':
+      case 'free':
+        break;
     }
 
-    let Nx = parseInt($('nxSelect').value);
-    let Ny = parseInt($('nySelect').value);
-    const dx = parseFloat($('dxNum').value);
-    const dy = parseFloat($('dyNum').value);
-    const lambda = parseFloat($('lambdaNum').value);
-    const dz = parseFloat($('dzNum').value);
-    const w0 = parseFloat($('w0Num').value);
+    let Nx = safeParseInt($('nxSelect').value, 256);
+    let Ny = safeParseInt($('nySelect').value, 256);
+    const dx = safeParseFloat($('dxNum').value, 10);
+    const dy = safeParseFloat($('dyNum').value, 10);
+    const lambda_nm = safeParseFloat($('lambdaNum').value, 532);
+    const dz = safeParseFloat($('dzNum').value, 100);
+    const w0 = safeParseFloat($('w0Num').value, 100);
 
     const tiltOn = $('tiltEnable').checked;
     const temporalOn = $('temporalCoherenceEnable').checked;
     const spatialOn = $('spatialCoherenceEnable').checked;
 
-    // Compute grid limits for current configuration
-    // If non-ideal mode, auto-reduce grid
     if (temporalOn || spatialOn) {
       if (Nx > 128) Nx = 128;
       if (Ny > 128) Ny = 128;
@@ -299,24 +277,24 @@
     }
 
     return {
-      apertureType,
-      apertureParams: params,
+      aperture_type: apertureType,
+      aperture_params: params,
       Nx, Ny, dx, dy,
-      lambda, dz, w0,
-      tiltOn,
-      tiltX: tiltOn ? parseFloat($('tiltXNum').value) : 0,
-      tiltY: tiltOn ? parseFloat($('tiltYNum').value) : 0,
-      temporalOn,
-      deltaLambda: temporalOn ? parseFloat($('deltaLambdaNum').value) : 0,
+      lambda_nm, dz, w0,
+      tilt_on: tiltOn,
+      tilt_x_deg: tiltOn ? parseFloat($('tiltXNum').value) : 0,
+      tilt_y_deg: tiltOn ? parseFloat($('tiltYNum').value) : 0,
+      temporal_on: temporalOn,
+      delta_lambda: temporalOn ? parseFloat($('deltaLambdaNum').value) : 0,
       M: temporalOn ? parseInt($('mSelect').value) : 1,
-      spatialOn,
+      spatial_on: spatialOn,
       K: spatialOn ? parseInt($('kSelect').value) : 1,
       padding: true,
-      bandLimited: true,
+      band_limited: true,
     };
   }
 
-  // ─── Trigger recompute ───
+  // ─── Trigger recompute via HTTP ───
   function requestCompute() {
     if (debounceTimer) clearTimeout(debounceTimer);
     debounceTimer = setTimeout(() => {
@@ -324,10 +302,17 @@
     }, 120);
   }
 
-  function doCompute() {
-    if (isComputing) return; // don't pile up
+  async function doCompute() {
+    if (isComputing) {
+      pendingRecompute = true;
+      return;
+    }
     const p = gatherParams();
-    requestId++;
+    isComputing = true;
+    setStatus('计算中... (' + p.Nx + '×' + p.Ny + ')');
+
+    // Render input preview (unchanged)
+    renderInputPreview(p);
 
     // Update Lx/Ly display
     const Lx = p.Nx * p.dx / 1000;
@@ -335,22 +320,23 @@
     $('lxDisplay').textContent = Lx.toFixed(3);
     $('lyDisplay').textContent = Ly.toFixed(3);
 
-    // Render input preview
-    renderInputPreview(p);
-
-    isComputing = true;
-    setStatus('计算中... (' + p.Nx + '×' + p.Ny + ')');
-
-    const msg = {
-      type: 'compute',
-      id: requestId,
-      params: p,
-    };
-
-    worker.postMessage(msg);
+    try {
+      const res = await fetch('/api/compute', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ params: p }),
+      });
+      if (!res.ok) throw new Error('HTTP ' + res.status);
+      const msg = await res.json();
+      handleResult(msg);
+    } catch (err) {
+      console.error('[Shell] compute failed:', err);
+      setStatus('错误: ' + err.message);
+      isComputing = false;
+    }
   }
 
-  // ─── Render input preview (main thread, no Worker needed) ───
+  // ─── Render input preview (unchanged) ───
   function renderInputPreview(p) {
     const nx = p.Nx, ny = p.Ny;
     const canvas = inputCanvas;
@@ -361,21 +347,20 @@
     const imgData = ctx.createImageData(canvas.width, canvas.height);
     const data = imgData.data;
 
-    if (p.apertureType === 'upload' && uploadedPixels) {
-      // Use uploaded image
+    if (p.aperture_type === 'upload' && uploadedPixels) {
+      const maxIdx = uploadedPixels.length;
       for (let i = 0; i < canvas.width * canvas.height; i++) {
-        const v = Math.min(255, Math.max(0, Math.round(uploadedPixels[i] * 255)));
+        const v = i < maxIdx ? Math.min(255, Math.max(0, Math.round(uploadedPixels[i] * 255))) : 0;
         const idx = i * 4;
         data[idx] = data[idx + 1] = data[idx + 2] = v;
         data[idx + 3] = 255;
       }
     } else {
-      // Generate aperture on main thread (simple visualization)
-      const xs = new Float64Array(nx);
-      const ys = new Float64Array(ny);
+      const xs = new Float64Array(ny);
+      const ys = new Float64Array(nx);
       const xc = (nx - 1) / 2, yc = (ny - 1) / 2;
-      for (let i = 0; i < nx; i++) xs[i] = (i - xc) * p.dx;
-      for (let j = 0; j < ny; j++) ys[j] = (j - yc) * p.dy;
+      for (let i = 0; i < nx; i++) ys[i] = (i - yc) * p.dy;
+      for (let j = 0; j < ny; j++) xs[j] = (j - xc) * p.dx;
 
       const scaleX = canvas.width / nx;
       const scaleY = canvas.height / ny;
@@ -386,21 +371,21 @@
           const nj = Math.floor(j / scaleY);
           let val = 0;
 
-          switch (p.apertureType) {
+          switch (p.aperture_type) {
             case 'slit':
-              val = Math.abs(xs[ni]) <= p.apertureParams.width / 2 ? 1 : 0;
+              val = Math.abs(xs[nj]) <= p.aperture_params.width / 2 ? 1 : 0;
               break;
             case 'doubleSlit': {
-              const halfW = p.apertureParams.width / 2;
-              const halfS = p.apertureParams.separation / 2;
-              val = (Math.abs(xs[ni] - halfS) <= halfW || Math.abs(xs[ni] + halfS) <= halfW) ? 1 : 0;
+              const halfW = p.aperture_params.width / 2;
+              const halfS = p.aperture_params.separation / 2;
+              val = (Math.abs(xs[nj] - halfS) <= halfW || Math.abs(xs[nj] + halfS) <= halfW) ? 1 : 0;
               break;
             }
             case 'circle':
-              val = (xs[ni] * xs[ni] + ys[nj] * ys[nj] <= p.apertureParams.radius * p.apertureParams.radius) ? 1 : 0;
+              val = (xs[nj] * xs[nj] + ys[ni] * ys[ni] <= p.aperture_params.radius * p.aperture_params.radius) ? 1 : 0;
               break;
             case 'rectangle':
-              val = (Math.abs(xs[ni]) <= p.apertureParams.width / 2 && Math.abs(ys[nj]) <= p.apertureParams.height / 2) ? 1 : 0;
+              val = (Math.abs(xs[nj]) <= p.aperture_params.width / 2 && Math.abs(ys[ni]) <= p.aperture_params.height / 2) ? 1 : 0;
               break;
             case 'free':
               val = 1;
@@ -414,7 +399,6 @@
         }
       }
     }
-
     ctx.putImageData(imgData, 0, 0);
   }
 
@@ -423,16 +407,11 @@
     $('statusMessage').textContent = msg;
   }
 
-  function isComparisonVisible() {
-    return $('comparisonRow').style.display !== 'none';
-  }
-
-  // ─── UI Bindings ───
+  // ─── UI Bindings (unchanged) ───
   function bindSlider(sliderId, numId, onChange) {
     const slider = $(sliderId);
     const num = $(numId);
     if (!slider || !num) return;
-
     slider.addEventListener('input', function() {
       num.value = slider.value;
       if (onChange) onChange();
@@ -471,9 +450,7 @@
     });
   }
 
-  // ─── Init UI ───
   function initUI() {
-    // Sliders
     bindSlider('dxRange', 'dxNum');
     bindSlider('dyRange', 'dyNum');
     bindSlider('lambdaRange', 'lambdaNum');
@@ -489,19 +466,16 @@
     bindSlider('tiltYRange', 'tiltYNum');
     bindSlider('deltaLambdaRange', 'deltaLambdaNum');
 
-    // Selects
     bindSelect('nxSelect', () => updateLxLy());
     bindSelect('nySelect', () => updateLxLy());
     bindSelect('mSelect');
     bindSelect('kSelect');
     bindSelect('sweepVar');
 
-    // Checkboxes for non-ideal
     bindCheckbox('tiltEnable', 'tiltParams');
     bindCheckbox('temporalCoherenceEnable', 'temporalParams');
     bindCheckbox('spatialCoherenceEnable', 'spatialParams');
 
-    // Aperture radio buttons
     $$('input[name="aperture"]').forEach(radio => {
       radio.addEventListener('change', function() {
         showApertureParams(this.value);
@@ -509,7 +483,6 @@
       });
     });
 
-    // Accordion
     $$('.group-title').forEach(el => {
       el.addEventListener('click', function() {
         const target = $(this.dataset.target);
@@ -519,20 +492,33 @@
       });
     });
 
-    // Mode toggle
-    $('modeToggle').addEventListener('click', function() {
-      isHighQuality = !isHighQuality;
-      if (isHighQuality) {
-        this.textContent = '高质量 512×512';
-        this.className = 'mode-btn inactive';
+    function toggleMode(target) {
+      if (target) {
+        isHighQuality = target.id === 'modeHQ';
       } else {
-        this.textContent = '实时 256×256';
-        this.className = 'mode-btn active';
+        isHighQuality = !isHighQuality;
       }
+      $('modeReal').className = 'mode-option' + (isHighQuality ? '' : ' active');
+      $('modeHQ').className   = 'mode-option' + (isHighQuality ? ' active' : '');
+      const oldNx = safeParseInt($('nxSelect').value, 256);
+      const newNx = isHighQuality ? 512 : 256;
+      const scale = oldNx / newNx;
+      const dx = safeParseFloat($('dxNum').value, 10);
+      const dy = safeParseFloat($('dyNum').value, 10);
+      ['dx', 'dy'].forEach(axis => {
+        const newVal = axis === 'dx' ? dx * scale : dy * scale;
+        const clamped = Math.max(1, Math.min(50, Math.round(newVal * 100) / 100));
+        $(axis + 'Range').value = clamped;
+        $(axis + 'Num').value = clamped;
+      });
+      $('nxSelect').value = newNx;
+      $('nySelect').value = newNx;
+      updateLxLy();
       requestCompute();
-    });
+    }
+    $('modeReal').addEventListener('click', function() { toggleMode(this); });
+    $('modeHQ').addEventListener('click', function() { toggleMode(this); });
 
-    // Image upload → send to Worker cache
     $('imageUpload').addEventListener('change', function(e) {
       const file = e.target.files[0];
       if (!file) return;
@@ -551,42 +537,26 @@
           for (let k = 0; k < p.Nx * p.Ny; k++) {
             pixels[k] = (imgData.data[k * 4] + imgData.data[k * 4 + 1] + imgData.data[k * 4 + 2]) / (3 * 255);
           }
-          // Cache in main thread and send to Worker
-          uploadedPixels = pixels;
-          worker.postMessage({
-            type: 'uploadImage',
-            pixels: pixels,
-            nx: p.Nx,
-            ny: p.Ny,
-          }, [pixels.buffer]);
+          uploadedPixels = new Float64Array(pixels);
           requestCompute();
         };
+        img.onerror = function() { setStatus('图片加载失败'); };
         img.src = ev.target.result;
       };
       reader.readAsDataURL(file);
     });
 
-    // Play button
     $('playBtn').addEventListener('click', toggleAnimation);
-
-    // Screenshot
     $('screenshotBtn').addEventListener('click', takeScreenshot);
-
-    // Reset
     $('resetBtn').addEventListener('click', resetAll);
 
-    // Init Lx/Ly display
     updateLxLy();
-
-    // Show aperture params for default
     showApertureParams('slit');
   }
 
   function showApertureParams(type) {
     const groups = ['slitParams', 'doubleSlitParams', 'circleParams', 'rectangleParams', 'uploadParams'];
-    groups.forEach(id => {
-      $(id).style.display = 'none';
-    });
+    groups.forEach(id => { $(id).style.display = 'none'; });
     switch (type) {
       case 'slit': $('slitParams').style.display = ''; break;
       case 'doubleSlit': $('doubleSlitParams').style.display = ''; break;
@@ -597,16 +567,15 @@
   }
 
   function updateLxLy() {
-    const Nx = parseInt($('nxSelect').value);
-    const Ny = parseInt($('nySelect').value);
-    const dx = parseFloat($('dxNum').value);
-    const dy = parseFloat($('dyNum').value);
+    const Nx = safeParseInt($('nxSelect').value, 256);
+    const Ny = safeParseInt($('nySelect').value, 256);
+    const dx = safeParseFloat($('dxNum').value, 10);
+    const dy = safeParseFloat($('dyNum').value, 10);
     $('lxDisplay').textContent = (Nx * dx / 1000).toFixed(3);
     $('lyDisplay').textContent = (Ny * dy / 1000).toFixed(3);
-    requestCompute();
   }
 
-  // ─── Animation ───
+  // ─── Animation (unchanged) ───
   let animId = null;
   let animRunning = false;
   function toggleAnimation() {
@@ -625,12 +594,9 @@
   function runAnimation() {
     if (!animRunning) return;
     const sweepVar = $('sweepVar').value;
-    // Simple animation: sweep dz or lambda in a sinusoidal pattern
     const t = Date.now() / 2000;
-    const p = gatherParams();
-
     if (sweepVar === 'dz') {
-      const min = 0.1, max = 500;
+      const min = 1, max = 500;
       const val = min * Math.pow(max / min, (Math.sin(t) + 1) / 2);
       $('dzNum').value = val.toFixed(3);
       $('dzRange').value = val;
@@ -640,12 +606,11 @@
       $('lambdaNum').value = Math.round(val);
       $('lambdaRange').value = Math.round(val);
     }
-
     doCompute();
     animId = setTimeout(() => runAnimation(), 200);
   }
 
-  // ─── Screenshot ───
+  // ─── Screenshot (unchanged) ───
   function takeScreenshot() {
     const canvas = intensityCanvas;
     canvas.toBlob(function(blob) {
@@ -658,7 +623,7 @@
     });
   }
 
-  // ─── Reset ───
+  // ─── Reset (unchanged) ───
   function resetAll() {
     $('lambdaNum').value = 532; $('lambdaRange').value = 532;
     $('dzNum').value = 100; $('dzRange').value = 100;
@@ -680,15 +645,14 @@
     $('kSelect').value = 5;
     $('comparisonRow').style.display = 'none';
     uploadedPixels = null;
+    isHighQuality = false;
+    $('modeReal').className = 'mode-option active';
+    $('modeHQ').className = 'mode-option';
     if (animRunning) toggleAnimation();
     requestCompute();
   }
 
   // ─── Boot ───
-  initWorker();
   initUI();
-
-  // Initial compute
   setTimeout(requestCompute, 300);
-
 })();
